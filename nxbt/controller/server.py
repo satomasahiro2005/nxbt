@@ -17,19 +17,30 @@ from .utils import format_msg_controller, format_msg_switch
 
 
 class RawJoyConRumbleBridge():
-    """Forward Switch rumble to a real Joy-Con L over raw L2CAP.
+    """Forward the Switch's rumble to a real Joy-Con over raw L2CAP.
 
-    NXBT builds ControllerServer in the parent process, then forks a child that
-    runs mainloop(). Threads started here stay in the parent and never see
-    Switch rumble reports. Joy-Con connection attempts are therefore launched
-    lazily from the child, while rumble writes stay in handle_switch_report().
+    The console's HD rumble frames (output reports 0x01/0x10/0x11) are
+    remapped for the Joy-Con's single motor and written to its interrupt
+    channel, so games physically rumble a real Joy-Con while input comes
+    from any controller NXBT emulates.
+
+    Configuration: the Joy-Con's Bluetooth MAC is read from the
+    NXBT_JOYCON_MAC environment variable, or from the first existing file
+    of /etc/nxbt/joycon_mac and ~/.config/nxbt/joycon_mac. Without a MAC
+    the bridge stays inert. Touch /tmp/nxbt_joycon_off to pause connection
+    attempts at runtime (a failed sync can leave zombie paging state that
+    starves the Switch link).
+
+    NXBT builds ControllerServer in the parent process, then forks a child
+    that runs mainloop(). Threads started in __init__ would stay in the
+    parent and never see Switch rumble reports, so connection attempts are
+    launched lazily from the child's tick()/handle_switch_report() calls.
     """
 
     _NEUTRAL_HALF = bytes([0x00, 0x01, 0x40, 0x40])
     _NEUTRAL = _NEUTRAL_HALF + _NEUTRAL_HALF
-    _SILENT = (bytes([0x00, 0x00, 0x00, 0x00]), _NEUTRAL_HALF)
     _RUMBLE_REPORTS = (0x01, 0x10, 0x11)
-    _JOYCON_L = "BC:74:4B:8B:98:82"
+    _PAUSE_FLAG = "/tmp/nxbt_joycon_off"
     _SOL_BLUETOOTH = 274
     _BT_SECURITY = 4
     _BT_SECURITY_LOW = 1
@@ -39,92 +50,48 @@ class RawJoyConRumbleBridge():
 
     def __init__(self, logger):
         self.logger = logger
+        self.joycon_address = self._resolve_joycon_address()
         self.control = None
         self.interrupt = None
         self.timer = 0
         self.last_write_at = 0.0
+        self.last_rumble_bytes = self._NEUTRAL
         self.next_connect_at = 0.0
         self.connecting = False
+        self.connect_fail_count = 0
         self.led_retry_until = 0.0
         self.last_led_at = 0.0
-        self.led_writes = 0
         self._led_ack_seen = False
-        self._led_ack_at = 0.0
         self.report_mode_retry_until = 0.0
         self.last_report_mode_at = 0.0
-        self.report_mode_writes = 0
         self._joycon_30_seen = False
-        self.last_rumble_bytes = self._NEUTRAL
-        self.last_switch_report_at = 0.0
-        self.last_switch_active_at = 0.0
-        self._last_rx_rumble = None
-        self._dbg_change = 0
-        self.connect_fail_count = 0
-        self.last_connect_fail_log = 0.0
-        self._dbg_seen = 0
-        self._dbg_raw = 0
-        self._dbg_rx = 0
-        self._dbg_sent = 0
-        self._reports = 0
-        self._active_reports = 0
-        self._sent = 0
-        self._sent_active = 0
-        self._write_fails = 0
-        self._last_stat_at = 0.0
-        self._last_reports = 0
-        self._last_active_reports = 0
-        self._last_sent = 0
-        self._last_sent_active = 0
-        self.capture_marker = "/tmp/rumble_capture_on"
-        self.capture_log = "/tmp/rumble_capture.log"
-        self.capture_until = 0.0
-        self.capture_count = 0
-        self._joycon_rx_seen = 0
-        self._last_joycon_vibrator = None
-        self.last_vib_ack = None
-        self._test_pulse_stop_at = 0.0
-        self._dbg("bridge init fork-safe sync")
+        if self.joycon_address is None:
+            self.logger.info(
+                "Joy-Con rumble bridge inert: no MAC configured "
+                "(set NXBT_JOYCON_MAC or /etc/nxbt/joycon_mac)")
 
-    def _dbg(self, msg):
-        try:
-            with open("/tmp/rumble_debug.log", "a") as f:
-                f.write("%.3f [pid %d] %s\n" % (time.time(), os.getpid(), msg))
-        except OSError:
-            pass
-
-    def _capture_rx(self, source, report_id, rumble, mapped, active, dt_ms,
-                    allow_connect):
-        now = time.time()
-        if now >= self.capture_until and os.path.exists(self.capture_marker):
+    def _resolve_joycon_address(self):
+        candidates = [os.environ.get("NXBT_JOYCON_MAC")]
+        for path in ("/etc/nxbt/joycon_mac",
+                     os.path.expanduser("~/.config/nxbt/joycon_mac")):
             try:
-                os.unlink(self.capture_marker)
+                with open(path) as f:
+                    candidates.append(f.read())
             except OSError:
-                pass
-            self.capture_until = now + 45.0
-            self.capture_count = 0
-            try:
-                with open(self.capture_log, "a") as f:
-                    f.write("%.3f [pid %d] capture start 45s\n"
-                            % (now, os.getpid()))
-                    f.write("time,pid,source,id,raw,mono,active,dt_ms,conn,allow\n")
-            except OSError:
-                pass
-
-        if now >= self.capture_until or self.capture_count >= 4000:
-            return
-
-        self.capture_count += 1
-        try:
-            with open(self.capture_log, "a") as f:
-                f.write("%.6f,%d,%s,0x%02x,%s,%s,%d,%.3f,%d,%d\n"
-                        % (now, os.getpid(), source, report_id, rumble.hex(),
-                           mapped.hex(), 1 if active else 0, dt_ms,
-                           1 if self.interrupt is not None else 0,
-                           1 if allow_connect else 0))
-        except OSError:
-            pass
+                continue
+        for value in candidates:
+            if not value:
+                continue
+            value = value.strip().upper()
+            if len(value) == 17 and value.count(":") == 5:
+                return value
+        return None
 
     def _mono_rumble(self, data):
+        # The console drives a Pro Controller's two motors in alternating
+        # frames (left = bytes 0:4, right = bytes 4:8). A single Joy-Con has
+        # one motor, so forward whichever half is actually driven, duplicated
+        # into both halves.
         if not self._is_active(data):
             return self._NEUTRAL
 
@@ -152,39 +119,6 @@ class RawJoyConRumbleBridge():
                 return True
         return False
 
-    def _stat(self):
-        now = time.time()
-        if now - self._last_stat_at < 1.0:
-            return
-        self._last_stat_at = now
-
-        reports_delta = self._reports - self._last_reports
-        active_delta = self._active_reports - self._last_active_reports
-        sent_delta = self._sent - self._last_sent
-        sent_active_delta = self._sent_active - self._last_sent_active
-        self._last_reports = self._reports
-        self._last_active_reports = self._active_reports
-        self._last_sent = self._sent
-        self._last_sent_active = self._sent_active
-
-        self._dbg(
-            "stat conn=%d connecting=%d reports=%d dreports=%d active=%d "
-            "dactive=%d sent=%d dsent=%d sent_active=%d dsent_active=%d fails=%d"
-            % (
-                1 if self.interrupt is not None else 0,
-                1 if self.connecting else 0,
-                self._reports,
-                reports_delta,
-                self._active_reports,
-                active_delta,
-                self._sent,
-                sent_delta,
-                self._sent_active,
-                sent_active_delta,
-                self._write_fails,
-            )
-        )
-
     def _connect_channel(self, psm):
         sock = socket.socket(
             socket.AF_BLUETOOTH,
@@ -199,16 +133,16 @@ class RawJoyConRumbleBridge():
             self._SOL_L2CAP,
             self._L2CAP_LM,
             self._L2CAP_LM_MASTER.to_bytes(4, "little"))
-        sock.connect((self._JOYCON_L, psm))
+        sock.connect((self.joycon_address, psm))
         sock.setblocking(False)
         return sock
 
     def _open(self):
         if self.interrupt is not None:
             return True
-        # Pause flag: stop hammering Joy-Con connects (they can leave zombie
-        # paging state that starves the Switch link -> input lag).
-        if os.path.exists("/tmp/jc_off"):
+        if self.joycon_address is None:
+            return False
+        if os.path.exists(self._PAUSE_FLAG):
             return False
         now = time.time()
         if self.connecting or now < self.next_connect_at:
@@ -231,17 +165,15 @@ class RawJoyConRumbleBridge():
             self.interrupt = interrupt
             self.last_write_at = time.time()
             self._enable_vibration(interrupt)
+            self._start_report_mode_retry()
             self._set_low_traffic_report_mode(interrupt)
             self._start_led_retry()
             self._set_player_lights(interrupt)
             self.connect_fail_count = 0
-            self._dbg("joycon connected + vibration enabled")
             self.logger.info("Raw Joy-Con L2CAP rumble ready")
         except OSError as e:
-            now = time.time()
-            if self.connect_fail_count < 5 or now - self.last_connect_fail_log > 15.0:
-                self._dbg("connect fail errno=%s %s" % (e.errno, e.strerror))
-                self.last_connect_fail_log = now
+            self.logger.debug(
+                "Joy-Con connect failed (errno=%s)" % e.errno)
             self.connect_fail_count += 1
             for sock in (interrupt, control):
                 if sock is None:
@@ -256,6 +188,9 @@ class RawJoyConRumbleBridge():
             self.connecting = False
 
     def _enable_vibration(self, sock):
+        # A real Joy-Con ignores rumble until it receives subcommand
+        # 0x48 0x01. 0xA2 is the HIDP DATA/output header required on the
+        # interrupt channel.
         report = bytes([0xA2, 0x01, self._next_timer()]) \
             + self._NEUTRAL + bytes([0x48, 0x01])
         report = report.ljust(49, b"\x00")
@@ -264,9 +199,7 @@ class RawJoyConRumbleBridge():
     def _start_led_retry(self):
         self.led_retry_until = time.time() + 12.0
         self.last_led_at = 0.0
-        self.led_writes = 0
         self._led_ack_seen = False
-        self._led_ack_at = 0.0
 
     def _set_player_lights(self, sock=None):
         if sock is None:
@@ -276,12 +209,13 @@ class RawJoyConRumbleBridge():
         report = bytes([0xA2, 0x01, self._next_timer()]) \
             + self._NEUTRAL + bytes([0x30, 0x09])
         report = report.ljust(49, b"\x00")
-        sent = sock.send(report)
-        self.led_writes += 1
-        if self.led_writes <= 12:
-            self._dbg("set player lights 1001 sent=%s" % sent)
+        sock.send(report)
 
     def _set_low_traffic_report_mode(self, sock=None):
+        # Keep the Joy-Con in simple HID mode (0x3F) instead of the 60 Hz
+        # full-report mode (0x30): its input stream is useless here and the
+        # extra airtime on a shared adapter causes input latency jitter on
+        # the Switch link.
         if sock is None:
             sock = self.interrupt
         if sock is None:
@@ -289,15 +223,11 @@ class RawJoyConRumbleBridge():
         report = bytes([0xA2, 0x01, self._next_timer()]) \
             + self._NEUTRAL + bytes([0x03, 0x3F])
         report = report.ljust(49, b"\x00")
-        sent = sock.send(report)
-        self.report_mode_writes += 1
-        if self.report_mode_writes <= 20:
-            self._dbg("set report mode 0x3F sent=%s" % sent)
+        sock.send(report)
 
     def _start_report_mode_retry(self):
         self.report_mode_retry_until = time.time() + 8.0
         self.last_report_mode_at = 0.0
-        self.report_mode_writes = 0
         self._joycon_30_seen = False
 
     def _next_timer(self):
@@ -313,8 +243,8 @@ class RawJoyConRumbleBridge():
             except BlockingIOError:
                 break
             except OSError as e:
-                self._write_fails += 1
-                self._dbg("joycon rx fail errno=%s %s" % (e.errno, e.strerror))
+                self.logger.debug(
+                    "Joy-Con rx failed (errno=%s)" % e.errno)
                 self.close()
                 break
             if not data:
@@ -326,33 +256,9 @@ class RawJoyConRumbleBridge():
             elif report_id == 0x21 and len(data) > 15:
                 ack = data[14]
                 subcmd = data[15]
-                if subcmd == 0x30 and ack & 0x80 and not self._led_ack_seen:
+                if subcmd == 0x30 and ack & 0x80:
                     self._led_ack_seen = True
-                    self._led_ack_at = time.time()
                     self.led_retry_until = 0.0
-                    self._dbg("player lights ack 0x%02x" % ack)
-            vibrator = data[13] if len(data) > 13 else None
-            if vibrator is not None and report_id in (0x21, 0x30, 0x31, 0x32, 0x33):
-                self.last_vib_ack = vibrator
-            changed = vibrator != self._last_joycon_vibrator
-            if changed:
-                self._last_joycon_vibrator = vibrator
-            if self._joycon_rx_seen < 120 or changed:
-                self._joycon_rx_seen += 1
-                vib_text = "--" if vibrator is None else "0x%02x" % vibrator
-                self._dbg(
-                    "joycon_rx id=0x%02x vib=%s len=%d raw24=%s"
-                    % (report_id, vib_text, len(data), bytes(data[:24]).hex())
-                )
-
-    def get_pro_vibrator_report(self, fallback):
-        # The vibrator ack is generated inside ControllerProtocol from the
-        # Switch's own output reports (_update_vibrator_ack): passing through
-        # the real Joy-Con's ack byte is wrong twice over -- it advertises a
-        # single-motor (0x30-base) controller, and it acks the frames WE
-        # forwarded, not the frames the Switch sent to the virtual Pro. The
-        # real ack (last_vib_ack) is still logged for reference.
-        return fallback
 
     def _write_rumble(self, rumble_bytes):
         # Airtime throttle: the Joy-Con keeps vibrating its current state, so
@@ -360,38 +266,22 @@ class RawJoyConRumbleBridge():
         # link (input latency jitter on the shared adapter). Forward changes
         # immediately, plus a 1 Hz keepalive.
         rb = bytes(rumble_bytes)
-        if (rb == getattr(self, "last_rumble_bytes", None)
-                and time.time() - getattr(self, "last_write_at", 0.0) < 1.0):
+        if (rb == self.last_rumble_bytes
+                and time.time() - self.last_write_at < 1.0):
             return
         if not self._open():
             return
-        report = bytes([0xA2, 0x10, self._next_timer()]) + bytes(rumble_bytes)
+        report = bytes([0xA2, 0x10, self._next_timer()]) + rb
         try:
             self.interrupt.send(report)
-            self.last_rumble_bytes = bytes(rumble_bytes)
-            self._sent += 1
+            self.last_rumble_bytes = rb
             self.last_write_at = time.time()
-            if self._is_active(rumble_bytes):
-                self._sent_active += 1
-            if rumble_bytes != self._NEUTRAL and self._dbg_sent < 80:
-                self._dbg_sent += 1
-                self._dbg("sent rumble %s" % bytes(rumble_bytes).hex())
         except OSError as e:
-            self._write_fails += 1
-            self._dbg("write fail errno=%s %s" % (e.errno, e.strerror))
+            self.logger.debug(
+                "Joy-Con rumble write failed (errno=%s)" % e.errno)
             self.close()
 
-    def handle_switch_report(self, report, allow_connect=True, source="main"):
-        if report and self._dbg_seen < 120:
-            self._dbg_seen += 1
-            try:
-                report_id = report[1] if len(report) > 1 else -1
-                self._dbg(
-                    "seen src=%s len=%d id=0x%02x raw16=%s"
-                    % (source, len(report), report_id, bytes(report[:16]).hex())
-                )
-            except (TypeError, ValueError):
-                self._dbg("seen malformed %r" % (report,))
+    def handle_switch_report(self, report, allow_connect=True):
         if not report or len(report) < 11 or report[0] != 0xA2:
             self.tick()
             return
@@ -399,120 +289,35 @@ class RawJoyConRumbleBridge():
             self.tick()
             return
 
-        self._reports += 1
-        now = time.time()
-        report_dt_ms = 0.0
-        if self.last_switch_report_at:
-            report_dt_ms = (now - self.last_switch_report_at) * 1000.0
-        self.last_switch_report_at = now
-
         rumble = bytes(report[3:11])
-        mapped = self._mono_rumble(rumble)
-        active = self._is_active(rumble)
-        self._capture_rx(source, report[1], rumble, mapped, active,
-                         report_dt_ms, allow_connect)
-        if rumble != self._last_rx_rumble:
-            self._last_rx_rumble = rumble
-            if self._dbg_change < 200:
-                self._dbg_change += 1
-                self._dbg(
-                    "rxchange src=%s id=0x%02x raw=%s mono=%s active=%d "
-                    "dt_ms=%.1f conn=%d allow=%d"
-                    % (source, report[1], rumble.hex(), mapped.hex(),
-                       1 if active else 0, report_dt_ms,
-                       1 if self.interrupt is not None else 0,
-                       1 if allow_connect else 0)
-                )
-        if self._dbg_rx < 80 and (active or self.interrupt is not None):
-            self._dbg_rx += 1
-            self._dbg(
-                "rx src=%s id=0x%02x raw=%s mono=%s active=%d conn=%d allow=%d"
-                % (source, report[1], rumble.hex(), mapped.hex(),
-                   1 if active else 0,
-                   1 if self.interrupt is not None else 0,
-                   1 if allow_connect else 0)
-            )
-        if active:
-            self._active_reports += 1
-            self.last_switch_active_at = now
-            if self._dbg_raw < 80:
-                self._dbg_raw += 1
-                self._dbg(
-                    "switch active src=%s id=0x%02x raw=%s mono=%s dt_ms=%.1f conn=%d allow=%d"
-                    % (source, report[1], rumble.hex(), mapped.hex(), report_dt_ms,
-                       1 if self.interrupt is not None else 0,
-                       1 if allow_connect else 0)
-                )
         if allow_connect:
-            self._write_rumble(mapped)
-        elif active and self._dbg_sent < 80:
-            self._dbg_sent += 1
-            self._dbg("drop setup rumble src=%s %s" % (source, mapped.hex()))
-        self._stat()
+            self._write_rumble(self._mono_rumble(rumble))
 
     def tick(self):
+        if self.joycon_address is None:
+            return
         if self.interrupt is None:
             self._open()
-        else:
-            self._drain_joycon_rx()
-            now = time.time()
-            if os.path.exists("/tmp/joycon_test_pulse"):
-                try:
-                    os.unlink("/tmp/joycon_test_pulse")
-                except OSError:
-                    pass
-                self._dbg("test pulse start")
-                self._write_rumble(bytes.fromhex("c318606dc318606d"))
-                self._test_pulse_stop_at = now + 0.12
-            if self._test_pulse_stop_at and now >= self._test_pulse_stop_at:
-                self._dbg("test pulse stop")
-                self._write_rumble(self._NEUTRAL)
-                self._test_pulse_stop_at = 0.0
-            if (now < self.led_retry_until
-                    and now - self.last_led_at > 0.5):
-                self.last_led_at = now
-                try:
-                    self._set_player_lights()
-                except OSError as e:
-                    self._write_fails += 1
-                    self._dbg("led write fail errno=%s %s" % (e.errno, e.strerror))
-                    self.close()
-                    self._stat()
-                    return
-            if (not self._joycon_30_seen
-                    and now < self.report_mode_retry_until
-                    and now - self.last_report_mode_at > 0.5):
-                self.last_report_mode_at = now
-                try:
-                    self._set_low_traffic_report_mode()
-                except OSError as e:
-                    self._write_fails += 1
-                    self._dbg("report mode write fail errno=%s %s" % (e.errno, e.strerror))
-                    self.close()
-        self._stat()
+            return
 
-    def preconnect(self, timeout=45.0):
-        self._dbg("joycon preconnect start timeout=%.1f" % timeout)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            self.tick()
-            now = time.time()
-            if (self.interrupt is not None
-                    and self._joycon_30_seen
-                    and self._led_ack_seen
-                    and now - self._led_ack_at > 0.25):
-                vib = self._last_joycon_vibrator
-                vib_text = "--" if vib is None else "0x%02x" % vib
-                self._dbg("joycon preconnect ready vib=%s led_ack=1" % vib_text)
-                return True
-            time.sleep(0.02)
-        self._dbg(
-            "joycon preconnect timeout conn=%d mode30=%d led_ack=%d"
-            % (1 if self.interrupt is not None else 0,
-               1 if self._joycon_30_seen else 0,
-               1 if self._led_ack_seen else 0)
-        )
-        return False
+        self._drain_joycon_rx()
+        now = time.time()
+        if (now < self.led_retry_until
+                and now - self.last_led_at > 0.5):
+            self.last_led_at = now
+            try:
+                self._set_player_lights()
+            except OSError:
+                self.close()
+                return
+        if (not self._joycon_30_seen
+                and now < self.report_mode_retry_until
+                and now - self.last_report_mode_at > 0.5):
+            self.last_report_mode_at = now
+            try:
+                self._set_low_traffic_report_mode()
+            except OSError:
+                self.close()
 
     def close(self):
         if self.interrupt is not None:
@@ -593,7 +398,7 @@ class ControllerServer():
         if now - self._input_rate_checked > 1.0:
             self._input_rate_checked = now
             try:
-                with open('/tmp/input_rate') as f:
+                with open('/tmp/nxbt_input_rate') as f:
                     self._input_rate = max(1, min(132, int(f.read().strip())))
             except (OSError, ValueError):
                 self._input_rate = 1
@@ -669,10 +474,8 @@ class ControllerServer():
                     next_reply = itr.recv(50)
                     if len(next_reply) > 40:
                         self.logger.debug(format_msg_switch(next_reply))
-                    self.rumble.handle_switch_report(next_reply, source="main")
+                    self.rumble.handle_switch_report(next_reply)
                     self.protocol.process_commands(next_reply)
-                    self.protocol.vibrator_report = self.rumble.get_pro_vibrator_report(
-                        self.protocol.vibrator_report)
                     msg = self.protocol.get_report()
                     if msg[1] != 0x00:
                         itr.sendall(msg)
@@ -712,8 +515,6 @@ class ControllerServer():
                 self.protocol.process_commands(None)
             self.input.set_protocol_input(state=self.state)
 
-            self.protocol.vibrator_report = self.rumble.get_pro_vibrator_report(
-                self.protocol.vibrator_report)
             msg = self.protocol.get_report()
 
             if self.logger_level <= logging.DEBUG and reply and len(reply) > 45:
@@ -728,7 +529,9 @@ class ControllerServer():
                 # Resend the current report at a steady cadence so the
                 # console keeps a rumble/output stream going (a real controller
                 # streams ~60 Hz). Rate is runtime-tunable in ticks via
-                # /tmp/input_rate (default 132 = stock keepalive ~2 s).
+                # /tmp/nxbt_input_rate. Default 1 = every tick, matching real
+                # hardware; raise it if input latency matters more than
+                # rumble delivery cadence.
                 elif self.tick >= self._input_rate_ticks():
                     itr.sendall(msg)
                     self.tick = 0
@@ -788,10 +591,8 @@ class ControllerServer():
                         if reply:
                             received_first_message = True
 
-                        self.rumble.handle_switch_report(reply, allow_connect=False, source="reconnect")
+                        self.rumble.handle_switch_report(reply, allow_connect=False)
                         self.protocol.process_commands(reply)
-                        self.protocol.vibrator_report = self.rumble.get_pro_vibrator_report(
-                            self.protocol.vibrator_report)
                         msg = self.protocol.get_report()
 
                         if self.logger_level <= logging.DEBUG and reply:
@@ -965,8 +766,6 @@ class ControllerServer():
 
                 # Send an empty input report to the Switch to prompt a reply
                 self.protocol.process_commands(None)
-                self.protocol.vibrator_report = self.rumble.get_pro_vibrator_report(
-                    self.protocol.vibrator_report)
                 msg = self.protocol.get_report()
                 itr.sendall(msg)
 
@@ -989,10 +788,8 @@ class ControllerServer():
                     if reply:
                         received_first_message = True
 
-                    self.rumble.handle_switch_report(reply, allow_connect=False, source="pairing")
+                    self.rumble.handle_switch_report(reply, allow_connect=False)
                     self.protocol.process_commands(reply)
-                    self.protocol.vibrator_report = self.rumble.get_pro_vibrator_report(
-                        self.protocol.vibrator_report)
                     msg = self.protocol.get_report()
 
                     if self.logger_level <= logging.DEBUG and reply:
@@ -1080,8 +877,6 @@ class ControllerServer():
 
         # Send an empty input report to the Switch to prompt a reply
         self.protocol.process_commands(None)
-        self.protocol.vibrator_report = self.rumble.get_pro_vibrator_report(
-            self.protocol.vibrator_report)
         msg = self.protocol.get_report()
         itr.sendall(msg)
 
