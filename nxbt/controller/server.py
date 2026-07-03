@@ -41,6 +41,7 @@ class RawJoyConRumbleBridge():
     _NEUTRAL = _NEUTRAL_HALF + _NEUTRAL_HALF
     _RUMBLE_REPORTS = (0x01, 0x10, 0x11)
     _PAUSE_FLAG = "/tmp/nxbt_joycon_off"
+    _CONNECT_TRIGGER = "/tmp/nxbt_joycon_connect"
     _SOL_BLUETOOTH = 274
     _BT_SECURITY = 4
     _BT_SECURITY_LOW = 1
@@ -51,6 +52,7 @@ class RawJoyConRumbleBridge():
     def __init__(self, logger):
         self.logger = logger
         self.joycon_address = self._resolve_joycon_address()
+        self._born = time.time()
         self.control = None
         self.interrupt = None
         self.timer = 0
@@ -144,6 +146,8 @@ class RawJoyConRumbleBridge():
             return False
         if os.path.exists(self._PAUSE_FLAG):
             return False
+        if not self._paging_allowed():
+            return False
         now = time.time()
         if self.connecting or now < self.next_connect_at:
             return False
@@ -152,6 +156,22 @@ class RawJoyConRumbleBridge():
         connector = Thread(target=self._connect_async)
         connector.daemon = True
         connector.start()
+        return False
+
+    def _paging_allowed(self):
+        # Paging a sleeping Joy-Con occupies the shared radio for ~2 s per
+        # attempt, which periodically starves the Switch link (input dies,
+        # console drops back to the registration screen). Only page when a
+        # connection is plausibly wanted: shortly after startup (the usual
+        # pair-then-sync flow), or after the trigger file has been touched
+        # (hold SYNC on the Joy-Con, then: touch /tmp/nxbt_joycon_connect).
+        if time.time() - self._born < 60.0:
+            return True
+        try:
+            if time.time() - os.path.getmtime(self._CONNECT_TRIGGER) < 90.0:
+                return True
+        except OSError:
+            pass
         return False
 
     def _connect_async(self):
@@ -171,6 +191,10 @@ class RawJoyConRumbleBridge():
             self._set_player_lights(interrupt)
             self.connect_fail_count = 0
             self.logger.info("Raw Joy-Con L2CAP rumble ready")
+            try:
+                os.unlink(self._CONNECT_TRIGGER)
+            except OSError:
+                pass
         except OSError as e:
             self.logger.debug(
                 "Joy-Con connect failed (errno=%s)" % e.errno)
