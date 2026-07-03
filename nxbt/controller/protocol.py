@@ -1,5 +1,7 @@
 from enum import Enum
+import os
 import random
+import time
 from time import perf_counter
 
 from .controller import ControllerTypes
@@ -40,7 +42,7 @@ class ControllerProtocol():
             "connection_info": 0x00
         }
     }
-    VIBRATOR_BYTES = [0xA0, 0xB0, 0xC0, 0x90]
+    VIBRATOR_BYTES = [0xFF]
 
     def __init__(self, controller_type, bt_address, report_size=50,
                  colour_body=None, colour_buttons=None):
@@ -112,7 +114,12 @@ class ControllerProtocol():
             self.right_stick_centre = [0x16, 0xD8, 0x7D]
 
         self.vibration_enabled = False
-        self.vibrator_report = random.choice(self.VIBRATOR_BYTES)
+        # Keep NXBT's stock vibrator input byte. Game rumble is gated by the
+        # 0x48 subcommand ACK being a plain 0x80, not by synthesizing this byte.
+        self.vibrator_report = 0xA0
+        self._dbg_subcommands = 0
+        self._dbg_reports = 0
+        self._last_dbg_vibrator = None
 
         # IMU (Six Axis Sensor) State
         self.imu_enabled = False
@@ -128,17 +135,58 @@ class ControllerProtocol():
         else:
             self.colour_buttons = colour_buttons
 
+    def _update_vibrator_ack(self, consumed):
+        self.vibrator_report = 0xA0
+
     def get_report(self):
 
         report = bytes(self.report)
+        if (len(report) > 15 and report[0] == 0xA1
+                and report[1] in (0x21, 0x30)):
+            vibrator = report[13]
+            changed = vibrator != self._last_dbg_vibrator
+            if changed:
+                self._last_dbg_vibrator = vibrator
+            interesting = report[1] == 0x21 or changed or self._dbg_reports < 20
+            if interesting and self._dbg_reports < 220:
+                self._dbg_reports += 1
+                self._dbg(
+                    "nxbt_tx id=0x%02x timer=0x%02x vib=0x%02x "
+                    "ack=0x%02x reply=0x%02x len=%d"
+                    % (
+                        report[1],
+                        report[2],
+                        vibrator,
+                        report[14],
+                        report[15],
+                        len(report),
+                    )
+                )
         # Clear report
         self.set_empty_report()
         return report
 
     def process_commands(self, data):
 
+        consumed = (data is not None and len(data) >= 11
+                    and data[0] == 0xA2 and data[1] in (0x01, 0x10, 0x11))
+        self._update_vibrator_ack(consumed)
+
         # Parsing the Switch's message
         message = SwitchReportParser(data)
+        if data and len(data) >= 12 and data[0] == 0xA2 and self._dbg_subcommands < 80:
+            self._dbg_subcommands += 1
+            self._dbg(
+                "subcmd out_id=0x%02x timer=0x%02x rumble=%s subcmd=0x%02x len=%d response=%s"
+                % (
+                    data[1],
+                    data[2],
+                    bytes(data[3:11]).hex(),
+                    data[11],
+                    len(data),
+                    getattr(message.response, "name", str(message.response)),
+                )
+            )
 
         # Responding to the parsed message
         if message.response == SwitchResponses.REQUEST_DEVICE_INFO:
@@ -206,16 +254,19 @@ class ControllerProtocol():
 
         self.report = empty_report
 
+    def _dbg(self, msg):
+        try:
+            with open("/tmp/rumble_debug.log", "a") as f:
+                f.write("%.3f [pid %d] %s\n" % (time.time(), os.getpid(), msg))
+        except OSError:
+            pass
+
     def set_subcommand_reply(self):
 
         # Input Report ID
         self.report[1] = 0x21
 
-        # TODO: Find out what the vibrator byte is doing.
-        # This is a hack in an attempt to semi-emulate
-        # actions of the vibrator byte as it seems to change
-        # when a subcommand reply is sent.
-        self.vibrator_report = random.choice(self.VIBRATOR_BYTES)
+        # set_standard_input_report() writes the stock vibrator byte.
 
         self.set_standard_input_report()
 
@@ -241,8 +292,8 @@ class ControllerProtocol():
         delta_t = (now - self.timestamp) * 1000
 
         # Get how many ticks have passed in hex with overflow at 255
-        # Joy-Con uses 4.96ms as the timer tick rate
-        elapsed_ticks = int(delta_t * 4)
+        # Joy-Con/Pro Controller input reports use a roughly 4.96ms timer tick.
+        elapsed_ticks = int(delta_t / 4.96)
         self.timer = (self.timer + elapsed_ticks) & 0xFF
 
         self.report[2] = self.timer
@@ -524,14 +575,19 @@ class ControllerProtocol():
 
     def enable_vibration(self):
 
-        # ACK Reply
-        self.report[14] = 0x82
+        # ACK Reply. A real controller replies to subcommand 0x48 with a
+        # plain ACK (0x80); 0x82 (ACK + device-info data type) is malformed
+        # and appears to make the console treat the vibration device as
+        # broken for applications (system rumble still works).
+        self.report[14] = 0x80
 
         # Subcommand reply
         self.report[15] = 0x48
 
         # Set class property
         self.vibration_enabled = True
+        self._dbg("ack enable_vibration report14=0x%02x report15=0x%02x" %
+                  (self.report[14], self.report[15]))
 
     def set_player_lights(self, message):
 
