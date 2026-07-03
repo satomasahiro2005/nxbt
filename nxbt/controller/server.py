@@ -505,7 +505,12 @@ class ControllerServer():
                     self.rumble.handle_switch_report(next_reply)
                     self.protocol.process_commands(next_reply)
                     msg = self.protocol.get_report()
-                    if msg[1] != 0x00:
+                    # Only send subcommand replies from the drain; input-
+                    # bearing 0x30 reports built here race the per-tick input
+                    # application and can carry stale/empty button state
+                    # (observed on air as held buttons flickering at the
+                    # console's output-report rate).
+                    if msg[1] == 0x21:
                         itr.sendall(msg)
                         self.cached_msg = msg[3:]
                         sent_drain_reply = True
