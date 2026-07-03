@@ -535,9 +535,11 @@ class ControllerServer():
                 except queue.Empty:
                     pass
 
-            # Set Direct Input
-            if self.state["direct_input"]:
-                self.input.set_controller_input(self.state["direct_input"])
+            # Set Direct Input. state is a multiprocessing Manager proxy, so
+            # every subscript is a cross-process round trip: fetch once.
+            direct_input = self.state["direct_input"]
+            if direct_input:
+                self.input.set_controller_input(direct_input)
 
             if reply is None or sent_drain_reply:
                 self.protocol.process_commands(None)
