@@ -161,12 +161,10 @@ class RawJoyConRumbleBridge():
     def _paging_allowed(self):
         # Paging a sleeping Joy-Con occupies the shared radio for ~2 s per
         # attempt, which periodically starves the Switch link (input dies,
-        # console drops back to the registration screen). Only page when a
-        # connection is plausibly wanted: shortly after startup (the usual
-        # pair-then-sync flow), or after the trigger file has been touched
-        # (hold SYNC on the Joy-Con, then: touch /tmp/nxbt_joycon_connect).
-        if time.time() - self._born < 60.0:
-            return True
+        # console drops back to the registration screen) -- even a startup
+        # grace window turned out to stab freshly-paired sessions. Page ONLY
+        # within 90 s of the trigger file being touched (hold SYNC on the
+        # Joy-Con, then: touch /tmp/nxbt_joycon_connect).
         try:
             if time.time() - os.path.getmtime(self._CONNECT_TRIGGER) < 90.0:
                 return True
