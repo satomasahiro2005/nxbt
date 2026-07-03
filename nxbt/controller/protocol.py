@@ -524,8 +524,14 @@ class ControllerProtocol():
 
     def enable_vibration(self):
 
-        # ACK Reply
-        self.report[14] = 0x82
+        # ACK Reply. Replies to 0x48 carry no data, and per the ack-byte
+        # convention (MSB set = ACK, low bits = reply data type, x00 for a
+        # simple ACK) the correct reply is a plain 0x80 -- which is also
+        # what a real Joy-Con replies on the wire (x80 x48). 0x82 declares
+        # "ACK with device-info data" and makes the console treat the
+        # vibration device as unusable for applications: system rumble
+        # still arrives, but games never send any.
+        self.report[14] = 0x80
 
         # Subcommand reply
         self.report[15] = 0x48
