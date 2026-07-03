@@ -261,13 +261,17 @@ class RawJoyConRumbleBridge():
                     self.led_retry_until = 0.0
 
     def _write_rumble(self, rumble_bytes):
-        # Airtime throttle: the Joy-Con keeps vibrating its current state, so
-        # re-sending identical frames only steals radio time from the Switch
-        # link (input latency jitter on the shared adapter). Forward changes
-        # immediately, plus a 1 Hz keepalive.
+        # Airtime throttle: re-sending identical frames steals radio time
+        # from the Switch link (input latency jitter on the shared adapter),
+        # so forward changes immediately and rate-limit repeats. The repeat
+        # interval matters: the Joy-Con's motor auto-stops without fresh
+        # rumble data (the console normally streams frames continuously), so
+        # sustained rumble must be refreshed fast enough to bridge that
+        # timeout, while idle neutral only needs a slow keepalive.
         rb = bytes(rumble_bytes)
+        keepalive = 0.1 if rb != self._NEUTRAL else 1.0
         if (rb == self.last_rumble_bytes
-                and time.time() - self.last_write_at < 1.0):
+                and time.time() - self.last_write_at < keepalive):
             return
         if not self._open():
             return
