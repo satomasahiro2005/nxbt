@@ -440,6 +440,8 @@ class ControllerServer():
 
         self.state["state"] = "initializing"
 
+        self.reconnect_address = reconnect_address
+
         try:
             # If we have a lock, prevent other controllers
             # from initializing at the same time and saturating the DBus,
@@ -462,6 +464,7 @@ class ControllerServer():
 
             self.switch_address = itr.getpeername()[0]
             self.state["last_connection"] = self.switch_address
+            self.reconnect_address = self.switch_address
 
             self.state["state"] = "connected"
 
@@ -792,10 +795,37 @@ class ControllerServer():
                 crw = Thread(target = self.connection_reset_watchdog)
                 crw.start()
 
-                itr, itr_address = s_itr.accept()
-                ctrl, ctrl_address = s_ctrl.accept()
+                # Wait for a Change Grip/Order pairing, but every 15 s also
+                # try dialing the remembered console: powering the console
+                # on is then enough to reconnect, no menu visit needed.
+                s_itr.settimeout(15)
+                redialed = False
+                while True:
+                    try:
+                        itr, itr_address = s_itr.accept()
+                        ctrl, ctrl_address = s_ctrl.accept()
+                        break
+                    except socket.timeout:
+                        address = getattr(self, "reconnect_address", None)
+                        if not address:
+                            continue
+                        try:
+                            itr, ctrl = self.reconnect(address)
+                            redialed = True
+                            break
+                        except OSError:
+                            continue
+                s_itr.settimeout(None)
 
                 self._crw_running = False
+
+                if redialed:
+                    for listener in (s_itr, s_ctrl):
+                        try:
+                            listener.close()
+                        except OSError:
+                            pass
+                    return itr, ctrl
 
                 # Send an empty input report to the Switch to prompt a reply
                 self.protocol.process_commands(None)
