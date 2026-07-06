@@ -1,6 +1,7 @@
 import socket
 import fcntl
 import os
+import subprocess
 import time
 import queue
 import logging
@@ -468,6 +469,7 @@ class ControllerServer():
 
             self.state["state"] = "connected"
 
+            self._set_page_scan(False)
             self.mainloop(itr, ctrl)
 
         except KeyboardInterrupt:
@@ -475,6 +477,7 @@ class ControllerServer():
         except Exception:
             try:
                 self.state["state"] = "crashed"
+                self._set_page_scan(True)
                 self.state["errors"] = traceback.format_exc()
                 return self.state
             except Exception as e:
@@ -482,6 +485,23 @@ class ControllerServer():
                 self.logger.debug(traceback.format_exc())
         finally:
             self.rumble.close()
+
+    def _set_page_scan(self, enabled):
+        # Page scan opens an 11.25 ms radio window every 1.28 s; on the
+        # shared adapter that window collides with the console's poll
+        # schedule and stalls input TX for 1-2 poll intervals (60-125 ms)
+        # per hit. The adapter never needs to be scannable while a session
+        # is live (console redial and Joy-Con sync are both dialed
+        # outbound), so scans stay off during play and come back whenever
+        # we wait for a pairing.
+        mode = "piscan" if enabled else "noscan"
+        try:
+            subprocess.run(
+                ["hciconfig", self.bt.device_id, mode],
+                timeout=3,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def mainloop(self, itr, ctrl):
 
@@ -761,6 +781,7 @@ class ControllerServer():
         while True:
             try:
                 self.state["state"] = "connecting"
+                self._set_page_scan(True)
 
                 # Creating control and interrupt sockets
                 s_ctrl = socket.socket(
